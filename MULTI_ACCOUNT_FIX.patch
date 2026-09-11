@@ -1,0 +1,30 @@
+--- a/app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
++++ b/app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
+@@ -141,7 +141,17 @@
+                             LockedResult(AccountSlotAdmission.Denied("account_slot_provision_pending"))
+                         }
+ 
+-                        record.activeUserIds.isEmpty() && configuredUserIds().isEmpty() -> {
++                        record.activeUserIds.size >= MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
++                            LockedResult(AccountSlotAdmission.Denied("account_slot_full"))
++                        }
++
++                        !hasVerifiedConfiguredUser(userId) -> {
++                            // A genuinely new runtime account has not had a chance to persist its
++                            // per-user config/self snapshot yet: admission happens before Config.load().
++                            // Reserve one free executable slot, let the normal initialization path
++                            // create config_v2.json + self.json, then confirmRuntimeUser() promotes it.
++                            // Already-known but manually disabled accounts stay manual-only so a host
++                            // account switch cannot silently undo an explicit "移出可执行槽位" action.
+                             LockedResult(
+                                 AccountSlotAdmission.Allowed(
+                                     userId,
+@@ -458,7 +468,7 @@
+                 (
+                     record.pendingRuntimeSinceMs <= 0L ||
+                         record.migrationState != AccountSlotMigrationState.READY ||
+-                        activeUserIds.isNotEmpty()
++                        pendingRuntimeUserId in activeUserIds
+                 )
+         ) {
+             return null
