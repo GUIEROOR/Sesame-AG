@@ -1,0 +1,125 @@
+name: Multi Account Fix Build
+
+on:
+  push:
+    branches:
+      - fix/multi-account-0.2.2
+    paths:
+      - MULTI_ACCOUNT_FIX.patch
+      - .github/workflows/multi-account-fix-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: multi-account-fix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  JAVA_DISTRIBUTION: "oracle"
+  JAVA_VERSION: "17.0.1"
+  ANDROID_PLATFORM: "android-37.0"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply multi-account fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git apply --check MULTI_ACCOUNT_FIX.patch; then
+            git apply MULTI_ACCOUNT_FIX.patch
+            echo "Multi-account patch applied."
+          elif git apply --reverse --check MULTI_ACCOUNT_FIX.patch; then
+            echo "Multi-account patch is already applied."
+          else
+            echo "Patch cannot be applied cleanly and is not already present."
+            exit 1
+          fi
+
+      - name: Verify intended source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F 'record.activeUserIds.size >= MAX_EXECUTABLE_ACCOUNT_SLOTS' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
+          grep -F '!hasVerifiedConfiguredUser(userId)' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
+          grep -F 'pendingRuntimeUserId in activeUserIds' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          architecture: x64
+          cache: gradle
+
+      - name: Pin Gradle Java Home
+        shell: bash
+        run: echo "ORG_GRADLE_JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;${ANDROID_PLATFORM}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          gradle-version: wrapper
+
+      - name: Grant execute permission
+        run: chmod +x gradlew
+
+      - name: Compile and build debug APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace \
+            :app:compileDebugKotlin \
+            :app:compileDebugJavaWithJavac \
+            :app:assembleDebug
+
+      - name: Commit verified source fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET='app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt'
+          if git diff --quiet -- "$TARGET"; then
+            echo "Source already committed; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$TARGET"
+          git commit -m "fix: restore automatic second-account provisioning"
+          git push origin HEAD:fix/multi-account-0.2.2
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sesame-AG-0.2.2-multi-account-fix-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
