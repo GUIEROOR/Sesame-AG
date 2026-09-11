@@ -24,7 +24,7 @@ env:
   ANDROID_BUILD_TOOLS: "37.0.0"
 
 jobs:
-  build-and-commit:
+  build-arm64-release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -50,9 +50,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -F 'record.activeUserIds.size >= MAX_EXECUTABLE_ACCOUNT_SLOTS' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
-          grep -F '!hasVerifiedConfiguredUser(userId)' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
-          grep -F 'pendingRuntimeUserId in activeUserIds' app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt
+          TARGET='app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt'
+          grep -F 'record.activeUserIds.size >= MAX_EXECUTABLE_ACCOUNT_SLOTS' "$TARGET"
+          grep -F '!hasVerifiedConfiguredUser(userId)' "$TARGET"
+          grep -F 'pendingRuntimeUserId in activeUserIds' "$TARGET"
+
+      - name: Configure arm64-v8a only for CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_FILE='app/build.gradle.kts'
+          sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")/include("arm64-v8a")/' "$BUILD_FILE"
+          sed -i 's/isUniversalApk = true/isUniversalApk = false/' "$BUILD_FILE"
+          sed -i 's/abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))/abiFilters.add("arm64-v8a")/' "$BUILD_FILE"
+          grep -F 'include("arm64-v8a")' "$BUILD_FILE"
+          grep -F 'isUniversalApk = false' "$BUILD_FILE"
+          grep -F 'abiFilters.add("arm64-v8a")' "$BUILD_FILE"
 
       - name: Set up JDK
         uses: actions/setup-java@v5
@@ -92,34 +105,34 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew
 
-      - name: Compile and build debug APKs
+      - name: Build optimized arm64 release APK
         shell: bash
         run: |
           set -euo pipefail
           ./gradlew --no-daemon --stacktrace \
-            :app:compileDebugKotlin \
-            :app:compileDebugJavaWithJavac \
-            :app:assembleDebug
+            :app:assembleRelease \
+            -PappVersion=0.2.2-MultiAccount
 
-      - name: Commit verified source fix
+      - name: Prepare final APK
         shell: bash
         run: |
           set -euo pipefail
-          TARGET='app/src/main/java/io/github/aoguai/sesameag/hook/AccountSlotRegistry.kt'
-          if git diff --quiet -- "$TARGET"; then
-            echo "Source already committed; nothing to commit."
-            exit 0
+          mkdir -p dist
+          APK="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*arm64-v8a*release*.apk' | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "arm64-v8a release APK not found. Available files:"
+            find app/build/outputs/apk/release -maxdepth 1 -type f -print || true
+            exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$TARGET"
-          git commit -m "fix: restore automatic second-account provisioning"
-          git push origin HEAD:fix/multi-account-0.2.2
+          cp "$APK" dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
+          ls -lh dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
+          sha256sum dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
 
-      - name: Upload APKs
+      - name: Upload arm64 release APK
         uses: actions/upload-artifact@v4
         with:
-          name: Sesame-AG-0.2.2-multi-account-fix-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: Sesame-AG-0.2.2-MultiAccount-arm64-v8a
+          path: dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
           if-no-files-found: error
+          compression-level: 9
           retention-days: 14
