@@ -1,0 +1,36 @@
+name: Export Android APK Signer
+
+on:
+  push:
+    branches:
+      - fix/multi-account-0.2.2
+    paths:
+      - .github/workflows/export-apksigner.yml
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "build-tools;37.0.0"
+          test -f "${ANDROID_HOME}/build-tools/37.0.0/lib/apksigner.jar"
+          mkdir -p signer
+          cp "${ANDROID_HOME}/build-tools/37.0.0/lib/apksigner.jar" signer/apksigner.jar
+          sha256sum signer/apksigner.jar
+
+      - name: Upload signer
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apksigner-37.0.0
+          path: signer/apksigner.jar
+          if-no-files-found: error
+          retention-days: 7
