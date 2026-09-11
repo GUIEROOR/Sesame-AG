@@ -1,19 +1,16 @@
-name: Multi Account Fix Build
+name: Multi Account Signed Release Build
 
 on:
   push:
     branches:
       - fix/multi-account-0.2.2
-    paths:
-      - MULTI_ACCOUNT_FIX.patch
-      - .github/workflows/multi-account-fix-build.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: multi-account-fix-${{ github.ref }}
+  group: multi-account-signed-release-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -23,15 +20,36 @@ env:
   ANDROID_PLATFORM: "android-37.0"
   ANDROID_BUILD_TOOLS: "37.0.0"
   PERMANENT_SIGNING_CERT_SHA256: "7490717E45CA309CCD8A5CF7053A469EBFFB1A8C84B537A84B82BA057FB4E963"
+  FINAL_APK_NAME: "Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk"
 
 jobs:
-  build-arm64-release:
+  build-sign-verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Validate permanent signing secrets
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${ANDROID_SIGNING_KEY}" ]] || missing+=("ANDROID_SIGNING_KEY")
+          [[ -n "${ANDROID_KEY_ALIAS}" ]] || missing+=("ANDROID_KEY_ALIAS")
+          [[ -n "${ANDROID_KEYSTORE_PASSWORD}" ]] || missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [[ -n "${ANDROID_KEY_PASSWORD}" ]] || missing+=("ANDROID_KEY_PASSWORD")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing GitHub Actions secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "Permanent signing secrets are configured."
 
       - name: Apply multi-account fix
         shell: bash
@@ -118,26 +136,77 @@ jobs:
             -PappVersion=0.2.2-MultiAccount \
             -PofficialSigningCertSha256="${PERMANENT_SIGNING_CERT_SHA256}"
 
-      - name: Prepare final APK
+      - name: Stage APK for permanent signing
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          rm -rf signing dist
+          mkdir -p signing dist
           APK="$(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*arm64-v8a*release*.apk' | head -n 1)"
-          if [ -z "$APK" ]; then
-            echo "arm64-v8a release APK not found. Available files:"
+          if [[ -z "${APK}" ]]; then
+            echo "arm64-v8a release APK not found. Available files:" >&2
             find app/build/outputs/apk/release -maxdepth 1 -type f -print || true
             exit 1
           fi
-          cp "$APK" dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
-          ls -lh dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
-          sha256sum dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
+          cp "${APK}" signing/Sesame-AG-0.2.2-MultiAccount-arm64-v8a-unsigned.apk
 
-      - name: Upload arm64 release APK
+      - name: Sign with permanent certificate
+        id: sign_apk
+        uses: ilharp/sign-android-release@v2
+        with:
+          releaseDir: signing
+          signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
+          keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          buildToolsVersion: ${{ env.ANDROID_BUILD_TOOLS }}
+
+      - name: Verify permanent signature and prepare final APK
+        shell: bash
+        env:
+          SIGNED_FILES: ${{ steps.sign_apk.outputs.signedFiles }}
+        run: |
+          set -euo pipefail
+          APKSIGNER="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          if [[ ! -x "${APKSIGNER}" ]]; then
+            APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS}/apksigner"
+          fi
+          [[ -x "${APKSIGNER}" ]] || { echo "apksigner not found" >&2; exit 1; }
+
+          IFS=':' read -r -a signed <<< "${SIGNED_FILES}"
+          final_source=""
+          for file in "${signed[@]}"; do
+            [[ -n "${file}" && -f "${file}" ]] || continue
+            if [[ -n "${final_source}" ]]; then
+              echo "Expected exactly one signed APK, but multiple files were returned." >&2
+              exit 1
+            fi
+            final_source="${file}"
+          done
+          [[ -n "${final_source}" ]] || { echo "Signing action returned no APK." >&2; exit 1; }
+
+          cert_output="$("${APKSIGNER}" verify --verbose --print-certs "${final_source}")"
+          printf '%s\n' "${cert_output}"
+          fingerprint="$(printf '%s\n' "${cert_output}" | awk -F': ' '/certificate SHA-256 digest:/ { digest=$NF; gsub(/:/, "", digest); print toupper(digest); exit }')"
+          if [[ "${fingerprint}" != "${PERMANENT_SIGNING_CERT_SHA256}" ]]; then
+            echo "Permanent signing certificate mismatch." >&2
+            echo "Expected: ${PERMANENT_SIGNING_CERT_SHA256}" >&2
+            echo "Actual:   ${fingerprint:-<none>}" >&2
+            exit 1
+          fi
+
+          cp "${final_source}" "dist/${FINAL_APK_NAME}"
+          ls -lh "dist/${FINAL_APK_NAME}"
+          sha256sum "dist/${FINAL_APK_NAME}" | tee "dist/${FINAL_APK_NAME}.sha256"
+          echo "Permanent certificate verified: ${fingerprint}"
+
+      - name: Upload permanently signed arm64 release
         uses: actions/upload-artifact@v4
         with:
-          name: Sesame-AG-0.2.2-MultiAccount-arm64-v8a
-          path: dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
+          name: Sesame-AG-0.2.2-MultiAccount-arm64-v8a-permanent-signed
+          path: |
+            dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk
+            dist/Sesame-AG-0.2.2-MultiAccount-arm64-v8a.apk.sha256
           if-no-files-found: error
           compression-level: 9
-          retention-days: 14
+          retention-days: 30
