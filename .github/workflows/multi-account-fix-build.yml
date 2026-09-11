@@ -62,10 +62,13 @@ jobs:
           BUILD_FILE='app/build.gradle.kts'
           sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")/include("arm64-v8a")/' "$BUILD_FILE"
           sed -i 's/isUniversalApk = true/isUniversalApk = false/' "$BUILD_FILE"
-          sed -i 's/abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))/abiFilters.add("arm64-v8a")/' "$BUILD_FILE"
+          sed -i '/abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))/d' "$BUILD_FILE"
           grep -F 'include("arm64-v8a")' "$BUILD_FILE"
           grep -F 'isUniversalApk = false' "$BUILD_FILE"
-          grep -F 'abiFilters.add("arm64-v8a")' "$BUILD_FILE"
+          if grep -Fq 'abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))' "$BUILD_FILE"; then
+            echo "Legacy CI ndk abiFilters are still present."
+            exit 1
+          fi
 
       - name: Set up JDK
         uses: actions/setup-java@v5
