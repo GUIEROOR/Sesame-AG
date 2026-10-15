@@ -137,11 +137,16 @@ object AccountSlotRegistry {
                             )
                         }
 
-                        record.pendingRuntimeUserId != null -> {
+                        record.pendingRuntimeUserId != null && !isPendingRuntimeSlotExpired(record) -> {
                             LockedResult(AccountSlotAdmission.Denied("account_slot_provision_pending"))
                         }
 
-                        record.activeUserIds.isEmpty() && configuredUserIds().isEmpty() -> {
+                        record.activeUserIds.size >= MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
+                            LockedResult(AccountSlotAdmission.Denied("account_slot_full"))
+                        }
+
+                        // Existing config marks a known account even while self.json is being rewritten.
+                        !File(Files.CONFIG_DIR, "$userId/config_v2.json").exists() -> {
                             LockedResult(
                                 AccountSlotAdmission.Allowed(
                                     userId,
@@ -175,23 +180,21 @@ object AccountSlotRegistry {
             ?: return AccountSlotRuntimeConfirmation.PendingPersistence
         return withLockedRecord(recoverExpiredPending = false) { loaded ->
             val record = loaded.record
+            val verified = hasVerifiedConfiguredUser(userId)
             when {
+                userId in record.activeUserIds -> {
+                    LockedResult(AccountSlotRuntimeConfirmation.Confirmed)
+                }
+
                 record.pendingRuntimeUserId != userId -> {
                     LockedResult(AccountSlotRuntimeConfirmation.PendingPersistence)
                 }
 
-                isPendingRuntimeSlotExpired(record) -> {
+                !verified -> {
                     LockedResult(
-                        AccountSlotRuntimeConfirmation.Expired,
-                        record.copy(
-                            pendingRuntimeUserId = null,
-                            pendingRuntimeSinceMs = 0L,
-                        ),
+                        if (isPendingRuntimeSlotExpired(record)) AccountSlotRuntimeConfirmation.Expired
+                        else AccountSlotRuntimeConfirmation.PendingPersistence,
                     )
-                }
-
-                !hasVerifiedConfiguredUser(userId) -> {
-                    LockedResult(AccountSlotRuntimeConfirmation.PendingPersistence)
                 }
 
                 record.activeUserIds.size + 1 > MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
@@ -266,14 +269,15 @@ object AccountSlotRegistry {
         val result = withLockedRecord { loaded ->
             val record = loaded.record
             val candidates = selectableUserIds()
+            val pendingOccupiesSlot = record.pendingRuntimeUserId != null && !isPendingRuntimeSlotExpired(record)
             val occupiedSlotCount = record.activeUserIds.size +
-                if (record.pendingRuntimeUserId == null) 0 else 1
+                if (pendingOccupiesSlot) 1 else 0
             when {
-                record.pendingRuntimeUserId != null -> {
+                makeExecutable && pendingOccupiesSlot -> {
                     LockedResult(AccountSlotReplacement(false, "account_slot_provision_pending"))
                 }
 
-                userId !in candidates -> {
+                makeExecutable && userId !in candidates -> {
                     LockedResult(AccountSlotReplacement(false, "unknown_slot_candidate"))
                 }
 
@@ -303,6 +307,8 @@ object AccountSlotRegistry {
                         record.copy(
                             migrationState = AccountSlotMigrationState.READY,
                             activeUserIds = activeUserIds,
+                            pendingRuntimeUserId = if (makeExecutable) null else record.pendingRuntimeUserId,
+                            pendingRuntimeSinceMs = if (makeExecutable) 0L else record.pendingRuntimeSinceMs,
                         ),
                     )
                 }
@@ -403,30 +409,31 @@ object AccountSlotRegistry {
         recoverExpiredPending: Boolean,
     ): AccountSlotRecord {
         val candidates = configuredUserIds()
-        val expiredPendingUserId = record.pendingRuntimeUserId
-            ?.takeIf { recoverExpiredPending && isPendingRuntimeSlotExpired(record) }
-        val recordWithoutExpiredPending = if (expiredPendingUserId == null) {
+        val confirmedPendingUserId = record.pendingRuntimeUserId
+            ?.takeIf { recoverExpiredPending && isPendingRuntimeSlotExpired(record) && it in candidates }
+        // Reads cannot discard unfinished enrollment; expired leases are reclaimed only by a new selection.
+        val recordWithConfirmedPending = if (confirmedPendingUserId == null) {
             record
         } else {
             record.copy(
+                activeUserIds = record.activeUserIds + confirmedPendingUserId,
                 pendingRuntimeUserId = null,
                 pendingRuntimeSinceMs = 0L,
             )
         }
         val recovered = when {
-            recordWithoutExpiredPending.migrationState == AccountSlotMigrationState.SELECTION_REQUIRED &&
+            recordWithConfirmedPending.migrationState == AccountSlotMigrationState.SELECTION_REQUIRED &&
                 candidates.size <= MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
-                recordWithoutExpiredPending.copy(
+                recordWithConfirmedPending.copy(
                     migrationState = AccountSlotMigrationState.READY,
                     activeUserIds = candidates,
                 )
             }
 
-            else -> recordWithoutExpiredPending
+            else -> recordWithConfirmedPending
         }
-        if (expiredPendingUserId != null) {
-            Log.record(TAG, "account_slot_provision_expired: account=${shortHash(expiredPendingUserId)}")
-            Log.w(TAG, "account_slot_provision_expired: account=${shortHash(expiredPendingUserId)}")
+        if (confirmedPendingUserId != null) {
+            Log.record(TAG, "account_slot_provision_confirmed: account=${shortHash(confirmedPendingUserId)}")
         }
         if (recovered != record) {
             Log.record(
@@ -455,7 +462,7 @@ object AccountSlotRegistry {
                 (
                     record.pendingRuntimeSinceMs <= 0L ||
                         record.migrationState != AccountSlotMigrationState.READY ||
-                        activeUserIds.isNotEmpty()
+                        pendingRuntimeUserId in activeUserIds
                 )
         ) {
             return null

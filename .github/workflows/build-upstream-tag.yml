@@ -1,8 +1,8 @@
-name: Build Upstream Tag 4315-0.2.4
+name: Build Verified Multi Account 0.2.4
 
 on:
   push:
-    branches: [codex/build-4315-0.2.4]
+    branches: [codex/fix-multi-account-0.2.4]
   workflow_dispatch:
 
 permissions:
@@ -11,27 +11,31 @@ permissions:
 env:
   CI: "true"
   SOURCE_TAG: "4315-0.2.4"
-  SOURCE_COMMIT: "63992d5fedd4d8604b4ebc01e08eb7c7b90fd7c0"
+  BASE_COMMIT: "63992d5fedd4d8604b4ebc01e08eb7c7b90fd7c0"
+  VERSION_NAME: "0.2.4-MultiAccount"
   SIGNING_CERT_SHA256: "7490717E45CA309CCD8A5CF7053A469EBFFB1A8C84B537A84B82BA057FB4E963"
   BUILD_TOOLS: "37.0.0"
-  APK_NAME: "Sesame-AG-4315-0.2.4-arm64-v8a-user-signed.apk"
+  APK_NAME: "Sesame-AG-0.2.4-MultiAccount-arm64-v8a-user-signed.apk"
 
 jobs:
   build-sign-verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout exact upstream tag commit with full history
+      - name: Checkout repaired source with full history
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.SOURCE_COMMIT }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Verify tag source and version
+      - name: Verify source ancestry and version
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "${SOURCE_COMMIT}" ]]
-          [[ "$(git rev-list --count HEAD)" == "4315" ]]
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          git merge-base --is-ancestor "${BASE_COMMIT}" HEAD
+          version_code="$(git rev-list --count HEAD)"
+          [[ "${version_code}" -gt 4315 ]]
+          echo "VERSION_CODE=${version_code}" >> "$GITHUB_ENV"
           grep -qx 'appVersion=0.2.4' gradle.properties
           [[ -z "$(git status --porcelain)" ]]
 
@@ -87,12 +91,20 @@ jobs:
         with:
           gradle-version: wrapper
 
-      - name: Build upstream release
+      - name: Verify multi-account regression scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain -p tests/account-slots run | tee account-slot-regression.log
+
+      - name: Build repaired release
         shell: bash
         run: |
           set -euo pipefail
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace :app:assembleRelease \
+            -PappVersion="${VERSION_NAME}" \
             -PofficialSigningCertSha256="${SIGNING_CERT_SHA256}"
 
       - name: Stage arm64 APK
@@ -103,6 +115,7 @@ jobs:
           mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*arm64-v8a*release*.apk')
           [[ ${#apks[@]} == 1 ]]
           cp "${apks[0]}" signing/upstream-unsigned.apk
+          cp account-slot-regression.log dist/ACCOUNT-SLOT-REGRESSION.txt
 
       - name: Sign with existing user certificate
         id: sign
@@ -129,22 +142,25 @@ jobs:
           fingerprint="$(printf '%s\n' "${cert_output}" | awk -F': ' '/certificate SHA-256 digest:/ {gsub(/:/, "", $NF); print toupper($NF); exit}')"
           [[ "${fingerprint}" == "${SIGNING_CERT_SHA256}" ]]
           "${tools}/aapt" dump badging "${signed[0]}" > dist/APK-METADATA.txt
-          grep -E "^package: .*versionCode='4315' versionName='0.2.4'" dist/APK-METADATA.txt
+          grep -F "versionCode='${VERSION_CODE}' versionName='${VERSION_NAME}'" dist/APK-METADATA.txt
           cp "${signed[0]}" "dist/${APK_NAME}"
           (cd dist && sha256sum "${APK_NAME}" > "${APK_NAME}.sha256")
           {
             echo "Upstream repository: https://github.com/Sesame-AG/Sesame-AG"
             echo "Source tag: ${SOURCE_TAG}"
-            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Base commit: ${BASE_COMMIT}"
+            echo "Source commit: ${GITHUB_SHA}"
+            echo "Version: ${VERSION_CODE}-${VERSION_NAME}"
             echo "Signing certificate SHA-256: ${fingerprint}"
-            echo "Build changes: arm64 ABI selection and user signing configuration only; no account-logic patches."
+            echo "Fixes: second-account admission, resumable provisioning, durable slots, explicit removal and truthful UI state."
+            echo "Regression results: see ACCOUNT-SLOT-REGRESSION.txt"
           } > dist/BUILD-INFO.txt
           cat "dist/${APK_NAME}.sha256"
 
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: Sesame-AG-4315-0.2.4-arm64-v8a-user-signed
+          name: Sesame-AG-0.2.4-MultiAccount-arm64-v8a-user-signed
           path: dist/*
           if-no-files-found: error
           retention-days: 30
