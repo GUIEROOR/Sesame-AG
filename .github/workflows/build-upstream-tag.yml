@@ -1,0 +1,150 @@
+name: Build Upstream Tag 4315-0.2.4
+
+on:
+  push:
+    branches: [codex/build-4315-0.2.4]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  SOURCE_TAG: "4315-0.2.4"
+  SOURCE_COMMIT: "63992d5fedd4d8604b4ebc01e08eb7c7b90fd7c0"
+  SIGNING_CERT_SHA256: "7490717E45CA309CCD8A5CF7053A469EBFFB1A8C84B537A84B82BA057FB4E963"
+  BUILD_TOOLS: "37.0.0"
+  APK_NAME: "Sesame-AG-4315-0.2.4-arm64-v8a-user-signed.apk"
+
+jobs:
+  build-sign-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact upstream tag commit with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          fetch-depth: 0
+
+      - name: Verify tag source and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${SOURCE_COMMIT}" ]]
+          [[ "$(git rev-list --count HEAD)" == "4315" ]]
+          grep -qx 'appVersion=0.2.4' gradle.properties
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Validate signing configuration
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_SIGNING_KEY ANDROID_KEY_ALIAS ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD; do
+            [[ -n "${!name}" ]] || { echo "Missing secret: $name" >&2; exit 1; }
+          done
+
+      - name: Configure arm64 build without conflicting ABI filters
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=app/build.gradle.kts
+          sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")/include("arm64-v8a")/' "$file"
+          sed -i 's/isUniversalApk = true/isUniversalApk = false/' "$file"
+          sed -i '/abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))/d' "$file"
+          grep -F 'include("arm64-v8a")' "$file"
+          grep -F 'isUniversalApk = false' "$file"
+          ! grep -Fq 'abiFilters.addAll(' "$file"
+          git diff --stat
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: oracle
+          java-version: "17.0.1"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "platforms;android-37.0" "build-tools;${BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Build upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease \
+            -PofficialSigningCertSha256="${SIGNING_CERT_SHA256}"
+
+      - name: Stage arm64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p signing dist
+          mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*arm64-v8a*release*.apk')
+          [[ ${#apks[@]} == 1 ]]
+          cp "${apks[0]}" signing/upstream-unsigned.apk
+
+      - name: Sign with existing user certificate
+        id: sign
+        uses: ilharp/sign-android-release@v2
+        with:
+          releaseDir: signing
+          signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
+          keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          buildToolsVersion: ${{ env.BUILD_TOOLS }}
+
+      - name: Verify certificate, version and checksums
+        shell: bash
+        env:
+          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+        run: |
+          set -euo pipefail
+          IFS=':' read -r -a signed <<< "${SIGNED_FILES}"
+          [[ ${#signed[@]} == 1 && -f "${signed[0]}" ]]
+          tools="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}"
+          cert_output="$("${tools}/apksigner" verify --verbose --print-certs "${signed[0]}")"
+          printf '%s\n' "${cert_output}"
+          fingerprint="$(printf '%s\n' "${cert_output}" | awk -F': ' '/certificate SHA-256 digest:/ {gsub(/:/, "", $NF); print toupper($NF); exit}')"
+          [[ "${fingerprint}" == "${SIGNING_CERT_SHA256}" ]]
+          "${tools}/aapt" dump badging "${signed[0]}" > dist/APK-METADATA.txt
+          grep -E "^package: .*versionCode='4315' versionName='0.2.4'" dist/APK-METADATA.txt
+          cp "${signed[0]}" "dist/${APK_NAME}"
+          (cd dist && sha256sum "${APK_NAME}" > "${APK_NAME}.sha256")
+          {
+            echo "Upstream repository: https://github.com/Sesame-AG/Sesame-AG"
+            echo "Source tag: ${SOURCE_TAG}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Signing certificate SHA-256: ${fingerprint}"
+            echo "Build changes: arm64 ABI selection and user signing configuration only; no account-logic patches."
+          } > dist/BUILD-INFO.txt
+          cat "dist/${APK_NAME}.sha256"
+
+      - name: Upload verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sesame-AG-4315-0.2.4-arm64-v8a-user-signed
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
