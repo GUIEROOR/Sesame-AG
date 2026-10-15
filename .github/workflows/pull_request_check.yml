@@ -87,6 +87,9 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Verify account-slot persistence and recovery
+        run: ./gradlew --no-daemon -p tests/account-slots run
+
       - name: Compile Debug Sources
         shell: bash
         run: |

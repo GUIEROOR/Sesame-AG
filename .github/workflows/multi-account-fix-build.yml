@@ -127,6 +127,9 @@ jobs:
       - name: Grant execute permission
         run: chmod +x gradlew
 
+      - name: Verify account-slot persistence and recovery
+        run: ./gradlew --no-daemon -p tests/account-slots run
+
       - name: Build optimized arm64 release APK
         shell: bash
         run: |
