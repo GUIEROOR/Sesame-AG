@@ -32,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -75,7 +76,7 @@ fun AutomationContent(
             )
         }
 
-        if (userList.isEmpty()) {
+        if (userList.isEmpty() && accountSlots.activeUserIds.isEmpty()) {
             item {
                 Text(
                     text = "还没有已载入的账号。请先打开目标应用，再返回模块同步当前账号。",
@@ -107,6 +108,25 @@ fun AutomationContent(
                         if (userId.isNotBlank()) pendingTodayFlagRemoval = userId
                     },
                 )
+            }
+        }
+
+        items(
+            items = accountSlots.activeUserIds.filter { userId -> userList.none { it.userId?.trim() == userId } },
+            key = { "unavailable-account-$it" },
+        ) { userId ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${maskUserId(userId)} · 槽位已保留", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "账号资料暂不可读取。重新登录该账号可恢复资料，也可手动移出槽位。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { pendingSlotRemoval = userId }) {
+                        Text("移出可执行槽位")
+                    }
+                }
             }
         }
 
