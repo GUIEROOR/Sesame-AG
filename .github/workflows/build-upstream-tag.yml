@@ -1,0 +1,196 @@
+name: Build Verified Private Storage Multi Account 0.2.6
+
+on:
+  push:
+    branches: [codex/fix-multi-account-0.2.6]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CI: "true"
+  SOURCE_TAG: "4380-0.2.6"
+  BASE_COMMIT: "15ffee2c75ad5b7ed55084552401b5e37cfd41f4"
+  VERSION_NAME: "0.2.6-MultiAccount"
+  SIGNING_CERT_SHA256: "7490717E45CA309CCD8A5CF7053A469EBFFB1A8C84B537A84B82BA057FB4E963"
+  BUILD_TOOLS: "37.0.0"
+  APK_NAME: "Sesame-AG-0.2.6-MultiAccount-arm64-v8a-user-signed.apk"
+
+jobs:
+  build-sign-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repaired source with full history
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify source ancestry and version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "${GITHUB_SHA}" ]]
+          git merge-base --is-ancestor "${BASE_COMMIT}" HEAD
+          version_code="$(git rev-list --count HEAD)"
+          [[ "${version_code}" -gt 4380 ]]
+          echo "VERSION_CODE=${version_code}" >> "$GITHUB_ENV"
+          grep -qx 'appVersion=0.2.6' gradle.properties
+          [[ -z "$(git status --porcelain)" ]]
+
+      - name: Validate signing configuration
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in ANDROID_SIGNING_KEY ANDROID_KEY_ALIAS ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_PASSWORD; do
+            [[ -n "${!name}" ]] || { echo "Missing secret: $name" >&2; exit 1; }
+          done
+
+      - name: Configure arm64 build without conflicting ABI filters
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=app/build.gradle.kts
+          sed -i 's/include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")/include("arm64-v8a")/' "$file"
+          sed -i 's/isUniversalApk = true/isUniversalApk = false/' "$file"
+          sed -i '/abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))/d' "$file"
+          grep -F 'include("arm64-v8a")' "$file"
+          grep -F 'isUniversalApk = false' "$file"
+          ! grep -Fq 'abiFilters.addAll(' "$file"
+          git diff --stat
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: oracle
+          java-version: "17.0.1"
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ""
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "platforms;android-37.0" "build-tools;${BUILD_TOOLS}"
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: wrapper
+
+      - name: Verify multi-account regression scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain -p tests/account-slots run | tee account-slot-regression.log
+
+      - name: Build repaired release
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease \
+            -PappVersion="${VERSION_NAME}" \
+            -PofficialSigningCertSha256="${SIGNING_CERT_SHA256}"
+
+      - name: Stage arm64 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p signing dist
+          mapfile -t apks < <(find app/build/outputs/apk/release -maxdepth 1 -type f -name '*arm64-v8a*release*.apk')
+          [[ ${#apks[@]} == 1 ]]
+          cp "${apks[0]}" signing/upstream-unsigned.apk
+          cp account-slot-regression.log dist/ACCOUNT-SLOT-REGRESSION.txt
+          cp tests/account-slots/INSTALL-UPGRADE.md dist/INSTALL-UPGRADE.md
+
+      - name: Sign with existing user certificate
+        id: sign
+        uses: ilharp/sign-android-release@v2
+        with:
+          releaseDir: signing
+          signingKey: ${{ secrets.ANDROID_SIGNING_KEY }}
+          keyAlias: ${{ secrets.ANDROID_KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          buildToolsVersion: ${{ env.BUILD_TOOLS }}
+
+      - name: Download previous delivered APK for upgrade verification
+        uses: actions/download-artifact@v4
+        with:
+          name: Sesame-AG-0.2.4-MultiAccount-arm64-v8a-user-signed
+          run-id: 38672380702
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: previous-release
+
+      - name: Verify certificate, version and checksums
+        shell: bash
+        env:
+          SIGNED_FILES: ${{ steps.sign.outputs.signedFiles }}
+        run: |
+          set -euo pipefail
+          IFS=':' read -r -a signed <<< "${SIGNED_FILES}"
+          [[ ${#signed[@]} == 1 && -f "${signed[0]}" ]]
+          tools="${ANDROID_HOME}/build-tools/${BUILD_TOOLS}"
+          cert_output="$("${tools}/apksigner" verify --verbose --print-certs "${signed[0]}")"
+          printf '%s\n' "${cert_output}"
+          fingerprint="$(printf '%s\n' "${cert_output}" | awk -F': ' '/certificate SHA-256 digest:/ {gsub(/:/, "", $NF); print toupper($NF); exit}')"
+          [[ "${fingerprint}" == "${SIGNING_CERT_SHA256}" ]]
+          "${tools}/aapt" dump badging "${signed[0]}" > dist/APK-METADATA.txt
+          grep -F "versionCode='${VERSION_CODE}' versionName='${VERSION_NAME}'" dist/APK-METADATA.txt
+          previous=previous-release/Sesame-AG-0.2.4-MultiAccount-arm64-v8a-user-signed.apk
+          [[ "$(sha256sum "$previous" | cut -d' ' -f1)" == "47f9344618dd8e7d5e65fa07e0579739af17036dd1e7962f2038bc01f0639147" ]]
+          previous_cert="$("${tools}/apksigner" verify --verbose --print-certs "$previous")"
+          previous_fingerprint="$(printf '%s\n' "$previous_cert" | awk -F': ' '/certificate SHA-256 digest:/ {gsub(/:/, "", $NF); print toupper($NF); exit}')"
+          [[ "${previous_fingerprint}" == "${fingerprint}" ]]
+          "${tools}/aapt" dump badging "$previous" > dist/PREVIOUS-APK-METADATA.txt
+          previous_package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" dist/PREVIOUS-APK-METADATA.txt)"
+          current_package="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" dist/APK-METADATA.txt)"
+          previous_code="$(sed -n "s/^package: .*versionCode='\([0-9]*\)'.*/\1/p" dist/PREVIOUS-APK-METADATA.txt)"
+          [[ "$current_package" == "io.github.aoguai.sesameag" && "$previous_package" == "$current_package" ]]
+          [[ "${VERSION_CODE}" -gt "$previous_code" ]]
+          {
+            echo "Previous delivered build: ${previous_code}-0.2.4-MultiAccount"
+            echo "New build: ${VERSION_CODE}-${VERSION_NAME}"
+            echo "Package unchanged: ${current_package}"
+            echo "Signing certificate unchanged: ${fingerprint}"
+            echo "Previous APK SHA-256 verified against the delivered file."
+            echo "Upgrade prerequisites passed; an actual on-device install has not been performed."
+          } > dist/UPGRADE-VERIFICATION.txt
+          cp "${signed[0]}" "dist/${APK_NAME}"
+          (cd dist && sha256sum "${APK_NAME}" > "${APK_NAME}.sha256")
+          {
+            echo "Upstream repository: https://github.com/Sesame-AG/Sesame-AG"
+            echo "Source tag: ${SOURCE_TAG}"
+            echo "Base commit: ${BASE_COMMIT}"
+            echo "Source commit: ${GITHUB_SHA}"
+            echo "Version: ${VERSION_CODE}-${VERSION_NAME}"
+            echo "Signing certificate SHA-256: ${fingerprint}"
+            echo "Fixes: private-store-aware enrollment, resumable provisioning, durable slots, explicit removal and truthful UI state."
+            echo "Regression results: see ACCOUNT-SLOT-REGRESSION.txt"
+          } > dist/BUILD-INFO.txt
+          cat "dist/${APK_NAME}.sha256"
+
+      - name: Upload verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sesame-AG-0.2.6-MultiAccount-arm64-v8a-user-signed
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30

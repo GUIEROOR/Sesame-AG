@@ -83,8 +83,8 @@ data class AccountSlotReplacement(
 
 /**
  * Separates locally stored account data from the accounts allowed to execute target-app work.
- * Registry writes are serialized across the module UI and injected target process with a stable lock
- * file; a lock or persistence failure deliberately denies business execution.
+ * Private-store transactions serialize module UI and injected target-process writes;
+ * a transaction or persistence failure deliberately denies business execution.
  */
 object AccountSlotRegistry {
     private const val TAG = "AccountSlotRegistry"
@@ -138,11 +138,13 @@ object AccountSlotRegistry {
                             )
                         }
 
-                        record.pendingRuntimeUserId != null -> {
+                        record.pendingRuntimeUserId != null && !isPendingRuntimeSlotExpired(record) -> {
                             LockedResult(AccountSlotAdmission.Denied("account_slot_provision_pending"))
                         }
 
-                        record.activeUserIds.isEmpty() && configuredUserIds().isEmpty() -> {
+                        // A known config stays manual-only even while its self snapshot is unavailable.
+                        record.activeUserIds.size < MAX_EXECUTABLE_ACCOUNT_SLOTS &&
+                            !Files.child(Files.child(Files.CONFIG_DIR, userId), "config_v2.json").exists() -> {
                             LockedResult(
                                 AccountSlotAdmission.Allowed(
                                     userId,
@@ -176,23 +178,21 @@ object AccountSlotRegistry {
             ?: return AccountSlotRuntimeConfirmation.PendingPersistence
         return withLockedRecord(recoverExpiredPending = false) { loaded ->
             val record = loaded.record
+            val verified = record.pendingRuntimeUserId == userId && hasVerifiedConfiguredUser(userId)
             when {
+                userId in record.activeUserIds -> {
+                    LockedResult(AccountSlotRuntimeConfirmation.Confirmed)
+                }
+
                 record.pendingRuntimeUserId != userId -> {
                     LockedResult(AccountSlotRuntimeConfirmation.PendingPersistence)
                 }
 
-                isPendingRuntimeSlotExpired(record) -> {
+                !verified -> {
                     LockedResult(
-                        AccountSlotRuntimeConfirmation.Expired,
-                        record.copy(
-                            pendingRuntimeUserId = null,
-                            pendingRuntimeSinceMs = 0L,
-                        ),
+                        if (isPendingRuntimeSlotExpired(record)) AccountSlotRuntimeConfirmation.Expired
+                        else AccountSlotRuntimeConfirmation.PendingPersistence,
                     )
-                }
-
-                !hasVerifiedConfiguredUser(userId) -> {
-                    LockedResult(AccountSlotRuntimeConfirmation.PendingPersistence)
                 }
 
                 record.activeUserIds.size + 1 > MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
@@ -268,14 +268,15 @@ object AccountSlotRegistry {
         val result = withLockedRecord { loaded ->
             val record = loaded.record
             val candidates = selectableUserIds()
+            val pendingOccupiesSlot = record.pendingRuntimeUserId != null && !isPendingRuntimeSlotExpired(record)
             val occupiedSlotCount = record.activeUserIds.size +
-                if (record.pendingRuntimeUserId == null) 0 else 1
+                if (pendingOccupiesSlot) 1 else 0
             when {
-                record.pendingRuntimeUserId != null -> {
+                makeExecutable && pendingOccupiesSlot -> {
                     LockedResult(AccountSlotReplacement(false, "account_slot_provision_pending"))
                 }
 
-                userId !in candidates -> {
+                makeExecutable && userId !in candidates -> {
                     LockedResult(AccountSlotReplacement(false, "unknown_slot_candidate"))
                 }
 
@@ -305,6 +306,8 @@ object AccountSlotRegistry {
                         record.copy(
                             migrationState = AccountSlotMigrationState.READY,
                             activeUserIds = activeUserIds,
+                            pendingRuntimeUserId = if (makeExecutable) null else record.pendingRuntimeUserId,
+                            pendingRuntimeSinceMs = if (makeExecutable) 0L else record.pendingRuntimeSinceMs,
                         ),
                     )
                 }
@@ -362,7 +365,7 @@ object AccountSlotRegistry {
     private fun selectableUserIds(): List<String> = configuredUserIds()
 
     private fun configuredUserIds(): List<String> =
-        Files.listExistingUserConfigIds()
+        Files.listExistingUserConfigIds(requireReadable = true)
             .asSequence()
             .map { userId -> Files.child(Files.CONFIG_DIR, userId) }
             .mapNotNull(::verifiedDirectoryUserId)
@@ -377,8 +380,9 @@ object AccountSlotRegistry {
         if (!configFile.isFile || configFile.length() == 0L || !selfFile.isFile || selfFile.length() == 0L) {
             return null
         }
+        val body = Files.readFromFile(selfFile)
         val snapshotUserId = runCatching {
-            JsonUtil.parseObject(Files.readFromFile(selfFile), UserEntity.UserDto::class.java).userId
+            JsonUtil.parseObject(body, UserEntity.UserDto::class.java).userId
         }.getOrNull()
         return normalizeUserId(snapshotUserId)?.takeIf { it == directoryUserId }
     }
@@ -409,29 +413,30 @@ object AccountSlotRegistry {
         } else {
             null
         }
-        val expiredPendingUserId = record.pendingRuntimeUserId
-            ?.takeIf { recoverExpiredPending && isPendingRuntimeSlotExpired(record) }
-        val recordWithoutExpiredPending = if (expiredPendingUserId == null) {
+        val confirmedPendingUserId = record.pendingRuntimeUserId
+            ?.takeIf { recoverExpiredPending && isPendingRuntimeSlotExpired(record) && hasVerifiedConfiguredUser(it) }
+        // Reads must not abandon enrollment; a new explicit choice can reclaim an expired lease.
+        val recordWithConfirmedPending = if (confirmedPendingUserId == null) {
             record
         } else {
             record.copy(
+                activeUserIds = record.activeUserIds + confirmedPendingUserId,
                 pendingRuntimeUserId = null,
                 pendingRuntimeSinceMs = 0L,
             )
         }
         val recovered = when {
             candidates != null && candidates.size <= MAX_EXECUTABLE_ACCOUNT_SLOTS -> {
-                recordWithoutExpiredPending.copy(
+                recordWithConfirmedPending.copy(
                     migrationState = AccountSlotMigrationState.READY,
                     activeUserIds = candidates,
                 )
             }
 
-            else -> recordWithoutExpiredPending
+            else -> recordWithConfirmedPending
         }
-        if (expiredPendingUserId != null) {
-            Log.record(TAG, "account_slot_provision_expired: account=${shortHash(expiredPendingUserId)}")
-            Log.w(TAG, "account_slot_provision_expired: account=${shortHash(expiredPendingUserId)}")
+        if (confirmedPendingUserId != null) {
+            Log.record(TAG, "account_slot_provision_confirmed: account=${shortHash(confirmedPendingUserId)}")
         }
         if (recovered != record) {
             Log.record(
@@ -460,7 +465,7 @@ object AccountSlotRegistry {
                 (
                     record.pendingRuntimeSinceMs <= 0L ||
                         record.migrationState != AccountSlotMigrationState.READY ||
-                        activeUserIds.isNotEmpty()
+                        pendingRuntimeUserId in activeUserIds
                 )
         ) {
             return null
@@ -524,8 +529,9 @@ object AccountSlotRegistry {
         if (!recordFile.exists()) {
             return LoadedRecord(bootstrapRecord(), needsWrite = true)
         }
+        val body = Files.readFromFile(recordFile)
         val parsedRecord = runCatching {
-            JsonUtil.parseObject(Files.readFromFile(recordFile), AccountSlotRecord::class.java)
+            JsonUtil.parseObject(body, AccountSlotRecord::class.java)
         }.getOrNull() ?: return null
         val validatedRecord = validateRecord(parsedRecord) ?: return null
         val recoveredRecord = recoverRecord(validatedRecord, recoverExpiredPending)

@@ -32,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,6 +64,14 @@ fun AutomationContent(
     var pendingSlotRemoval by rememberSaveable { mutableStateOf<String?>(null) }
     var pendingTodayFlagRemoval by rememberSaveable { mutableStateOf<String?>(null) }
 
+    if (accountSlots.errorCode != null) {
+        Column(modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("账号槽位暂不可读取", style = MaterialTheme.typography.titleMedium)
+            Text("已保存的槽位选择未更改。请稍后重新打开模块重试。")
+        }
+        return
+    }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
@@ -75,7 +84,17 @@ fun AutomationContent(
             )
         }
 
-        if (userList.isEmpty()) {
+        accountSlots.pendingRuntimeUserId?.let { userId ->
+            item {
+                Text(
+                    "账号 ${maskUserId(userId)} 正在建档。若初始化中断，重新登录该账号可继续；已有槽位会保留。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        if (userList.isEmpty() && accountSlots.activeUserIds.isEmpty() && accountSlots.pendingRuntimeUserId == null) {
             item {
                 Text(
                     text = "还没有已载入的账号。请先打开目标应用，再返回模块同步当前账号。",
@@ -94,6 +113,7 @@ fun AutomationContent(
                 AccountCard(
                     user = user,
                     isExecutable = userId in accountSlots.activeUserIds,
+                    isProvisioning = userId == accountSlots.pendingRuntimeUserId,
                     onOpenSettings = { onOpenSettings(user) },
                     onOpenFriendCenter = { onOpenFriendCenter(user) },
                     onSetExecutableSlot = { enabled ->
@@ -107,6 +127,23 @@ fun AutomationContent(
                         if (userId.isNotBlank()) pendingTodayFlagRemoval = userId
                     },
                 )
+            }
+        }
+
+        items(
+            items = accountSlots.activeUserIds.filter { userId -> userList.none { it.userId?.trim() == userId } },
+            key = { "unavailable-account-$it" },
+        ) { userId ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("${maskUserId(userId)} · 槽位已保留", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "账号资料暂不可读取。重新登录该账号可恢复资料，也可手动移出槽位。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { pendingSlotRemoval = userId }) { Text("移出可执行槽位") }
+                }
             }
         }
 
@@ -152,6 +189,7 @@ fun AutomationContent(
 private fun AccountCard(
     user: UserEntity,
     isExecutable: Boolean,
+    isProvisioning: Boolean,
     onOpenSettings: () -> Unit,
     onOpenFriendCenter: () -> Unit,
     onSetExecutableSlot: (Boolean) -> Unit,
@@ -206,7 +244,11 @@ private fun AccountCard(
                 Text(
                     text = buildString {
                         append(maskUserId(userId))
-                        append(if (isExecutable) " · 可执行" else " · 仅保留配置")
+                        append(when {
+                            isExecutable -> " · 可执行"
+                            isProvisioning -> " · 待完成建档"
+                            else -> " · 仅保留配置"
+                        })
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (isExecutable) {
@@ -231,6 +273,7 @@ private fun AccountCard(
             ) {
                 AccountActionMenuItems(
                     isExecutable = isExecutable,
+                    slotChangeEnabled = !isProvisioning,
                     userId = userId,
                     onDismiss = ::closeMenus,
                     onOpenSettings = onOpenSettings,
@@ -249,6 +292,7 @@ private fun AccountCard(
     ) {
         AccountActionMenuItems(
             isExecutable = isExecutable,
+            slotChangeEnabled = !isProvisioning,
             userId = userId,
             onDismiss = ::closeMenus,
             onOpenSettings = onOpenSettings,
@@ -264,6 +308,7 @@ private fun AccountCard(
 @Composable
 private fun AccountActionMenuItems(
     isExecutable: Boolean,
+    slotChangeEnabled: Boolean,
     userId: String,
     onDismiss: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -290,6 +335,7 @@ private fun AccountActionMenuItems(
     )
     DropdownMenuItem(
         text = { Text(if (isExecutable) "移出槽位" else "移入槽位") },
+        enabled = slotChangeEnabled,
         leadingIcon = {
             Icon(
                 if (isExecutable) Icons.Outlined.DeleteOutline else Icons.Outlined.Add,
